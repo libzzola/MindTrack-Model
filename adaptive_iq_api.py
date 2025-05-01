@@ -53,11 +53,15 @@ class StartGameRequest(BaseModel):
     question_pool: List[Question]
     question_count: int = Field(..., ge=1)
     previous_statistics: Optional[PreviousStatistics] = None
+    calibration_phase: bool = False  # Whether to use calibration phase or go directly to adaptive
 
 class NextQuestionRequest(BaseModel):
+    attemptId: int
     previousQuestionId: int
     sessionId: str
+    answerId: int
     correct: bool
+    timeTaken: int  # Time taken to answer in seconds
 
 class GameSession(BaseModel):
     session_id: str
@@ -76,6 +80,10 @@ class GameSession(BaseModel):
     difficulty_counts: List[int] = []
     modality_perf: Dict[str, Dict[str, int]] = {}
     diff_perf: Dict[str, Dict[str, int]] = {}
+    calibration_phase: bool = False
+    in_calibration: bool = False
+    calibration_questions_per_modality: int = 2
+    calibration_questions_completed: Dict[str, int] = {}
     
     class Config:
         arbitrary_types_allowed = True
@@ -88,10 +96,11 @@ def normalize_reward(r):
     """Normalize reward to [-1, 1] range"""
     return max(-1.0, min(1.0, r / 3))
 
-def assign_reward(correct, difficulty):
-    """Calculate reward based on correctness and difficulty"""
+def assign_reward(correct, time_taken, difficulty):
+    """Calculate reward based on correctness, time taken, and difficulty"""
     base = 1 if correct else -1
-    return base * (1.0 + 0.1 * DIFFICULTY_MAP.get(difficulty, 0))
+    time_penalty = min(time_taken / 10, 1)  # Scale time penalty (capped at 1)
+    return (base - time_penalty) * (1.0 + 0.1 * DIFFICULTY_MAP.get(difficulty, 0))
 
 def ucb_select(estimates, counts, total_trials):
     """UCB algorithm for selection"""
@@ -123,6 +132,32 @@ def adjust_difficulty_bias(session, current_difficulty):
         session.difficulty_rewards[diff_idx+1] += 0.15
 
 def select_question(session):
+    """Select next question based on session phase (calibration or adaptive)"""
+    if session.in_calibration:
+        return select_calibration_question(session)
+    else:
+        return select_adaptive_question(session)
+
+def select_calibration_question(session):
+    """Select a question for the calibration phase"""
+    # Find a modality that still needs calibration questions
+    for modality in MODALITY_TYPES:
+        if session.calibration_questions_completed.get(modality, 0) < session.calibration_questions_per_modality:
+            # Filter unused questions of this modality
+            filtered = [q for q in session.question_pool 
+                       if q['modality'] == modality 
+                       and q['id'] not in session.used_questions]
+            
+            if filtered:
+                session.calibration_questions_completed[modality] = session.calibration_questions_completed.get(modality, 0) + 1
+                return random.choice(filtered)
+    
+    # If we've completed calibration for all modalities, move to adaptive phase
+    session.in_calibration = False
+    # Now call the adaptive selection
+    return select_adaptive_question(session)
+
+def select_adaptive_question(session):
     """Select next question using UCB algorithm"""
     # Convert lists to numpy arrays for UCB calculations
     modality_rewards = np.array(session.modality_rewards)
@@ -194,6 +229,11 @@ def initialize_session(request_data: StartGameRequest):
             weight = 1 + (0.1 * idx)  # Harder levels weighted more
             difficulty_rewards[idx] = 2 * (success_rate - 0.5) * weight
     
+    # Set up calibration if requested
+    calibration_phase = request_data.calibration_phase
+    in_calibration = calibration_phase
+    calibration_questions_completed = {mod: 0 for mod in MODALITY_TYPES} if calibration_phase else {}
+    
     # Create session
     session = GameSession(
         session_id=session_id,
@@ -206,7 +246,10 @@ def initialize_session(request_data: StartGameRequest):
         difficulty_rewards=difficulty_rewards,
         difficulty_counts=difficulty_counts,
         modality_perf=modality_perf,
-        diff_perf=diff_perf
+        diff_perf=diff_perf,
+        calibration_phase=calibration_phase,
+        in_calibration=in_calibration,
+        calibration_questions_completed=calibration_questions_completed
     )
     
     # Store session
@@ -214,7 +257,7 @@ def initialize_session(request_data: StartGameRequest):
     
     return session
 
-def process_answer(session, correct, question):
+def process_answer(session, correct, question, time_taken):
     """Process the user's answer and update the model"""
     session.total_trials += 1
     session.score += 1 if correct else 0
@@ -236,7 +279,7 @@ def process_answer(session, correct, question):
     session.diff_perf[difficulty]['correct'] += int(correct)
     
     # Calculate and apply reward
-    reward = assign_reward(correct, difficulty)
+    reward = assign_reward(correct, time_taken, difficulty)
     norm_reward = normalize_reward(reward)
     
     # Convert lists to numpy arrays
@@ -317,7 +360,8 @@ async def next_question(request: NextQuestionRequest):
     process_answer(
         session=session,
         correct=request.correct,
-        question=last_question_info['question']
+        question=last_question_info['question'],
+        time_taken=request.timeTaken
     )
     
     # Check if we've reached the end of the test
@@ -343,11 +387,15 @@ async def next_question(request: NextQuestionRequest):
     # Update session
     active_sessions[session.session_id] = session
     
+    # Add phase info to response
+    phase = "calibration" if session.in_calibration else "adaptive"
+    
     return {
         "session_id": session.session_id,
         "current_question": question,
         "question_number": session.current_question_index,
-        "total_questions": session.question_count
+        "total_questions": session.question_count,
+        "phase": phase
     }
 
 def calculate_results(session):
@@ -365,7 +413,8 @@ def calculate_results(session):
             modality_performance[mod] = {
                 "correct": correct,
                 "total": total,
-                "percentage": round((correct/total) * 100, 1)
+                "percentage": round((correct/total) * 100, 1),
+                "success": (correct/total)  # Raw value for future sessions
             }
     
     difficulty_performance = {}
@@ -376,7 +425,8 @@ def calculate_results(session):
             difficulty_performance[diff] = {
                 "correct": correct,
                 "total": total,
-                "percentage": round((correct/total) * 100, 1)
+                "percentage": round((correct/total) * 100, 1),
+                "success": (correct/total)  # Raw value for future sessions
             }
     
     # Clean up the session (in a real application, you might want to store it in a database instead)
